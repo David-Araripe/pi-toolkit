@@ -28,7 +28,7 @@ Restart Pi or run `/reload`. To try it for one session only, run `pi -e git:gith
 | `extensions/provider-picker.ts` | `/provider`: pick a provider first, then a model |
 | `extensions/session-breakdown.ts` | Usage and cost breakdown across sessions |
 | `extensions/fork-here.ts`, `commit-command.ts`, `productivity-commands.ts` | `/fork-here`, `/commit`, `/grill-me`, `/teach`, `/handoff` |
-| `skills/` | `commit`, `dataviz`, `grilling`, `grill-me`, `handoff`, `pi-share`, `simplify`, `teach` |
+| `skills/` | `commit`, `dataviz`, `grilling`, `grill-me`, `handoff`, `simplify`, `teach` |
 | `prompts/` | `/review`, `/dataviz`, `/simplify` |
 
 ## HPC hosts are machine-local
