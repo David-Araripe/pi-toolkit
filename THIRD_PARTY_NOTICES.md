@@ -11,13 +11,12 @@ The upstream work is licensed under the Apache License, Version 2.0. A copy is i
 - `extensions/btw.ts`
 - `extensions/goal.ts`
 - `skills/commit/SKILL.md`
-- `skills/pi-share/SKILL.md`
-- `skills/pi-share/fetch-session.mjs`
 
 ### Adapted
 
 - `extensions/notify.ts` — notifications are delayed until `agent_settled` and limited to interactive TUI sessions.
 - `extensions/session-breakdown.ts` — session discovery respects `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR`; its main dark categorical palette was replaced with a contrast- and CVD-screened palette.
+- `skills/pi-share/SKILL.md`, `skills/pi-share/fetch-session.mjs` — script paths no longer assume `~/.pi/agent/skills`; the human-summary prompt is passed through stdin and the `pi` shim is resolved through a shell on Windows.
 - `prompts/review.md` — incorporates review criteria and structured-output ideas from `extensions/review.ts`, adapted to this repository's existing prompt-template workflow.
 
 Each adapted source file carries a notice describing the changes.
