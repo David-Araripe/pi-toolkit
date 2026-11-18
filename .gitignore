@@ -1,0 +1,14 @@
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
+
+# Secrets and machine-local settings
+.env
+.env.*
+hpc-hosts.json
+
+node_modules/
+*.log
