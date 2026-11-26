@@ -1,6 +1,8 @@
 /**
  * Copied from mitsuhiko/agent-stuff at revision 13bc8f8 under Apache-2.0.
- * This file is unchanged apart from this provenance notice.
+ * Changed: side sessions share the main session's model runtime (Pi 1.6 dropped the
+ * createAgentSession modelRegistry option), so extension providers such as Claude Code work,
+ * and are seeded through their session manager, because Pi 1.6 ignores agent.state.messages.
  * See ../THIRD_PARTY_NOTICES.md and ../licenses/mitsuhiko-agent-stuff-Apache-2.0.txt.
  */
 
@@ -80,6 +82,17 @@ type ToolCallInfo = {
 	args: string;
 	status: "running" | "done" | "error";
 };
+
+/**
+ * Pi 1.6 replaced createAgentSession's modelRegistry option with modelRuntime and gives
+ * extensions only the ModelRegistry facade. Without the main runtime, a side session builds
+ * a default one that lacks extension-registered providers (e.g. claude-code) and fails
+ * with a login error. The facade keeps its runtime in a private field; reuse it when present.
+ */
+function sharedModelRuntime(ctx: ExtensionContext): { modelRuntime?: AgentSession["modelRuntime"] } {
+	const runtime = (ctx.modelRegistry as unknown as { runtime?: AgentSession["modelRuntime"] }).runtime;
+	return runtime && typeof runtime.getModel === "function" ? { modelRuntime: runtime } : {};
+}
 
 function stripDynamicSystemPromptFooter(systemPrompt: string): string {
 	return systemPrompt
@@ -560,19 +573,19 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 
+		// Pi 1.6 builds the model context from the session manager; assigning
+		// session.agent.state.messages is ignored, so seed the in-memory session instead.
+		const sessionManager = SessionManager.inMemory();
+		for (const message of buildSeedMessages(ctx, thread)) sessionManager.appendMessage(message);
+
 		const { session } = await createAgentSession({
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			model: ctx.model,
-			modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+			...sharedModelRuntime(ctx),
 			thinkingLevel: pi.getThinkingLevel() as SessionThinkingLevel,
 			tools: ["read", "bash", "edit", "write"],
 			resourceLoader: createBtwResourceLoader(ctx),
 		});
-
-		const seedMessages = buildSeedMessages(ctx, thread);
-		if (seedMessages.length > 0) {
-			session.agent.state.messages = seedMessages as typeof session.agent.state.messages;
-		}
 
 		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 			if (!sideBusy || !pendingQuestion) {
@@ -752,7 +765,7 @@ export default function (pi: ExtensionAPI) {
 		const { session } = await createAgentSession({
 			sessionManager: SessionManager.inMemory(),
 			model,
-			modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+			...sharedModelRuntime(ctx),
 			thinkingLevel: "off",
 			tools: [],
 			resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARY_PROMPT]),

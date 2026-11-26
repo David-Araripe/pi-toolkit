@@ -30,6 +30,7 @@ export function loadTypeScript(path) {
       "@earendil-works/pi-coding-agent": join(agentRoot, "dist/index.js"),
       "@earendil-works/pi-ai/compat": piDependency("@earendil-works/pi-ai", "dist/compat.js"),
       "@earendil-works/pi-ai": piDependency("@earendil-works/pi-ai"),
+      "@earendil-works/pi-tui": piDependency("@earendil-works/pi-tui"),
       "typebox": require.resolve("typebox"),
     } });
   }
