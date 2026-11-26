@@ -7,8 +7,6 @@ Works on macOS, Linux, and native Windows (Git Bash or Pi's optional `powershell
 
 ```bash
 pi install git:github.com/David-Araripe/pi-toolkit
-# or pin a release
-pi install git:github.com/David-Araripe/pi-toolkit@v0.1.0
 ```
 
 Restart Pi or run `/reload`. To try it for one session only, run `pi -e git:github.com/David-Araripe/pi-toolkit`.
@@ -194,7 +192,7 @@ in your own Pi settings instead:
 ```json
 {
   "packages": [
-    "git:github.com/David-Araripe/pi-toolkit@v0.1.0",
+    "git:github.com/David-Araripe/pi-toolkit",
     "git:github.com/<owner>/private-pi-overlay"
   ]
 }
