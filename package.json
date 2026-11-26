@@ -1,7 +1,7 @@
 {
   "name": "pi-toolkit",
-  "version": "0.1.0",
-  "description": "Portable Pi extensions, skills, and prompts: safety guard, HPC/Slurm mode, goals, productivity helpers",
+  "version": "0.2.0",
+  "description": "Portable Pi extensions, skills, and prompts: safety guard, HPC/Slurm mode, subagents, agent messaging, background shells, goals, productivity helpers",
   "keywords": [
     "pi-package"
   ],
