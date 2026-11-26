@@ -83,6 +83,18 @@ test("explicit command and confirmation enable removal, off revokes immediately"
   assert.match(h.prompt(), /Do not remove/);
 });
 
+test("bg_shell start gets the same local shell checks as bash; other actions pass", async () => {
+  const h = harness();
+  const bg = (input) => h.event("tool_call", { toolName: "bg_shell", input });
+  for (const command of ["rm -rf target", "cat ~/.ssh/config", "ssh host", "codex exec hi"]) {
+    assert.ok((await bg({ action: "start", command })).block, command);
+  }
+  assert.ok((await bg({ action: "start" })).block);
+  assert.equal(await bg({ action: "start", command: "cargo test --release" }), undefined);
+  assert.equal(await bg({ action: "list" }), undefined);
+  assert.equal(await bg({ action: "watch", pid: 123 }), undefined);
+});
+
 test("declined confirmation and non-UI mode cannot grant rights", async () => {
   const h = harness();
   h.confirm(async () => false);
@@ -228,4 +240,95 @@ test("the PowerShell tool is guarded like bash", async () => {
   await h.ssh();
   assert.equal(await h.shell("ssh.exe host", "powershell"), undefined);
   assert.ok((await h.shell("ssh host", "hpc_exec")).block);
+});
+
+test("Claude Code and Codex run only through subagents; subagent state is not writable", async () => {
+  const h = harness();
+  for (const command of ["claude -p hi", "codex exec x", "cd w && nohup codex exec x &", "env A=1 claude --bg x", "/Users/x/.local/bin/claude -p", "y=$(codex exec z)"]) {
+    assert.match((await h.shell(command))?.reason ?? "", /\/cc-agent or \/codex-agent/, command);
+  }
+  for (const command of ["claude --version", "codex --help", "ls ~/.claude/projects", "grep -r codex src", "git log --grep claude"]) {
+    assert.equal(await h.shell(command), undefined, command);
+  }
+  // Mentions in quoted text and here-documents are not invocations.
+  for (const command of ['git commit -m "docs: run claude -p; codex exec"', "grep -n 'a\\|claude -p' README.md", 'rg -e "codex|claude" src | head',
+    "cat > notes.md <<'EOF'\nclaude -p hi\ncodex exec x\nEOF", "cat <<EOF >> notes.md\ncodex exec x\nEOF", 'echo "use: claude --resume" | tee x']) {
+    assert.equal(await h.shell(command), undefined, command);
+  }
+  for (const command of ['bash -c "claude -p hi"', "zsh -c 'cd w; codex exec x'", 'echo "$(claude -p hi)"', "sh <<EOF\ncodex exec x\nEOF", "cat <<EOF\n`claude -p x`\nEOF",
+    'git commit -m "x" && claude -p hi']) {
+    assert.match((await h.shell(command))?.reason ?? "", /\/cc-agent or \/codex-agent/, command);
+  }
+  assert.equal(await h.shell("cat ~/.pi/agent/subagents/runs/abcd1234/state.json"), undefined);
+  for (const command of ["echo '{}' > ~/.pi/agent/subagents/runs/abcd1234/inbox/1.json", "PI_SUBAGENT_RUN_DIR=/tmp pi -p x", "cp x $HOME/.pi/agent/subagents/runs/a/hpc-grants.json"]) {
+    assert.match((await h.shell(command))?.reason ?? "", /subagent state/, command);
+  }
+  for (const toolName of ["write", "edit"]) {
+    const result = await h.event("tool_call", { toolName, input: { path: "~/.pi/agent/subagents/runs/abcd1234/hpc-grants.json" } });
+    assert.match(result?.reason ?? "", /subagent state/, toolName);
+  }
+  // Read-only loops and pipelines over run folders are fine, even with quoted ">".
+  const R = "~/.pi/agent/subagents/runs";
+  for (const command of [
+    `for id in a b; do echo "== $id"; ls ${R}/$id/reports ${R}/$id/reports/delivered | tr '\\n' ' '; echo; done`,
+    `for f in ${R}/*/x.html; do echo "== $(basename $f): $(wc -c <$f) bytes"; grep -o 'class="entry [a-z]*"' $f | sort | uniq -c; grep -oE 'Native</th><td>[^<]*' $f; done`,
+    `ls ${R} 2>/dev/null | head`, `find ${R} -name '*.json' | wc -l`,
+  ]) assert.equal(await h.shell(command), undefined, command);
+  for (const command of [
+    `for f in ${R}/*; do cat x > $f/inbox/1.json; done`, `ls ${R} | tee ${R}/a`, `cp x ${R}/a/hpc-grants.json`,
+    `python3 -c 'print(1)' ${R}`, `sed -i '' s/a/b/ ${R}/a/state.json`, `echo $(cp a ${R}/b)`, `find ${R} -fprint ${R}/x`,
+    `cd ${R} && mv a b`, `X=1 cat ${R}/a`,
+  ]) assert.match((await h.shell(command))?.reason ?? "", /subagent state/, command);
+  // hpc_exec runs remotely; local CLI rules do not apply there.
+  assert.equal(await h.shell("codex --version; ls", "hpc_exec"), undefined);
+});
+
+test("delegated agents cannot start nested pi sessions; root sessions can", async (t) => {
+  const h = harness();
+  const launches = [
+    "pi -p hi", "pi", "cd w && pi --mode rpc", "env -i HOME=$HOME PATH=$PATH pi -p hi", "env -u FOO pi -p hi", "FOO=1 pi -p hi",
+    "/opt/homebrew/bin/pi -p hi", "nohup pi -p hi &", "x=$(pi -p hi)", "echo hi | pi -p", "pi --session other.jsonl --help me",
+    "./node_modules/.bin/pi -p hi", "exec pi", "timeout 30 pi -p hi", "echo x | xargs -n1 pi -p", "time pi -p hi", "sudo env A=1 /usr/local/bin/pi -p hi",
+    "npx pi -p hi", "npx -y @earendil-works/pi-coding-agent -p hi", "node /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js -p hi",
+  ];
+  const harmless = ["pi --help", "pi --version; ls", "cat pi.txt", "ls ~/.pi/agent/skills", "python3 pi.py", "./pi.sh", "grep -r pi src", "echo pi", "cd pi && ls", "pip install x",
+    "pipx run x", "pino --version", "api --list", "ls /pi/x", "./pi/run.sh", "cat src/pi/a.ts", "node pi.js", "npx pip-tools", "npx pino", "timeout 5 ls pi",
+    "cat /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/README.md", "ls node_modules/@earendil-works/pi-coding-agent/docs | head"];
+  for (const command of [...launches, ...harmless]) assert.equal(await h.shell(command), undefined, `root: ${command}`);
+  const saved = process.env.PI_SUBAGENT;
+  process.env.PI_SUBAGENT = "1";
+  t.after(() => { if (saved === undefined) delete process.env.PI_SUBAGENT; else process.env.PI_SUBAGENT = saved; });
+  for (const command of launches) assert.match((await h.shell(command))?.reason ?? "", /cannot start pi sessions/, command);
+  assert.match((await h.event("tool_call", { toolName: "bg_shell", input: { action: "start", command: "pi -p hi" } }))?.reason ?? "", /cannot start pi sessions/);
+  for (const command of harmless) assert.equal(await h.shell(command), undefined, command);
+  // Text that only mentions pi is data: messages, patterns, written files.
+  const mentions = [
+    'git commit -m "fix (pi -p) flag"', "git commit -m 'pi; pi -p hi'", 'echo "run: pi -p hi" >> notes.md', "grep -rn 'x\\|pi -p' src",
+    'printf "%s\\n" "a; pi --mode rpc"', "cat > doc.md <<'EOF'\npi -p hi\nnpx pi\nEOF", "cat <<EOF >> README.md\nRun:\npi --mode rpc\nEOF\nls",
+    'python3 - <<PY\nprint("""\npi -p hi\n""")\nPY', 'gh pr create --title "pi" --body "$(cat <<\'EOF\'\npi -p hi\nEOF\n)"',
+  ];
+  for (const command of mentions) assert.equal(await h.shell(command), undefined, command);
+  // Quoted or here-document text that a shell runs is still code.
+  for (const command of ['bash -c "pi -p hi"', "sh -lc 'cd w && pi -p hi'", 'eval "pi -p hi"', 'echo "$(pi -p hi)"', "bash <<EOF\npi -p hi\nEOF",
+    "cat <<'EOF' | sh\npi -p hi\nEOF", "cat <<EOF\n$(pi -p hi)\nEOF", "cat <<'EOF'\nx\nEOF\npi -p hi", 'echo "it\'s"; pi -p hi; echo \'x\'']) {
+    assert.match((await h.shell(command))?.reason ?? "", /cannot start pi sessions/, command);
+  }
+  // The environment rules still hold on their own.
+  for (const command of ["PI_SUBAGENT= node x.mjs", "env -u PI_SUBAGENT node x.mjs", "PI_AGENT_COMM_ID=abc node x.mjs", "unset PI_SUBAGENT"]) {
+    assert.match((await h.shell(command))?.reason ?? "", /subagent state/, command);
+  }
+});
+
+test("agent-comm member records, mailboxes and identity variables are not writable by agents", async () => {
+  const h = harness();
+  const C = "~/.pi/agent/agent-comm";
+  assert.equal(await h.shell(`ls ${C}/mail/abcd1234/new | wc -l`), undefined);
+  for (const command of [
+    `echo '{}' > ${C}/members/abcd1234.json`, `cp x ${C}/mail/abcd1234/new/1.json`, `mv ${C}/mail/a/new/x ${C}/mail/a/cur/`,
+    "PI_AGENT_COMM_ID=deadbeef pi -p hi", "export PI_AGENT_COMM_SCOPE=team; pi", "env -u PI_AGENT_COMM_ID pi",
+  ]) assert.match((await h.shell(command))?.reason ?? "", /agent-comm state/, command);
+  for (const toolName of ["write", "edit"]) {
+    const result = await h.event("tool_call", { toolName, input: { path: `${C}/members/abcd1234.json` } });
+    assert.match(result?.reason ?? "", /agent-comm state/, toolName);
+  }
 });

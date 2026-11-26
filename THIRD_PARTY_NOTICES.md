@@ -41,3 +41,35 @@ The upstream work is licensed under the MIT License. A copy is included at [`lic
 - `skills/handoff/SKILL.md` — replaces Skill-tool instructions with Pi equivalents; adds unique temporary files, active-host awareness, a continuation checklist, path reporting, temporary-file caveats, and explicit document-only behavior.
 
 Each skill also carries license and provenance metadata. `extensions/productivity-commands.ts` is a local alias implementation, not an upstream import. Upstream agent-specific YAML files are not needed by Pi and are not included. Updates are manual and should be reviewed against this pinned revision before adoption.
+
+## Agent communication design inspirations
+
+`extensions/agent-comm/` was written for this toolkit; no source code was
+copied from the projects below, whose designs were reviewed:
+
+- [`nicobailon/pi-intercom`](https://github.com/nicobailon/pi-intercom) (MIT):
+  session discovery, request/reply and peer-authority framing.
+- [`vieko/pi-post`](https://github.com/vieko/pi-post) (MIT) and
+  [`nicknisi/pi-relay`](https://github.com/nicknisi/pi-extensions/tree/main/packages/relay)
+  (MIT): brokerless write-then-rename mailboxes, persistent identities and
+  unread backlog caps.
+- [`frostime/pi-mail`](https://github.com/frostime/pi-mail) (GPL-3.0; ideas
+  only): a single compound tool and pull-based retrieval.
+- [`nicobailon/pi-messenger`](https://github.com/nicobailon/pi-messenger)
+  (MIT declared in `package.json`, no license file; ideas only): pid-based
+  liveness.
+
+## Subagent design inspirations
+
+`extensions/subagents/` was written for this toolkit; no source code was
+copied from the projects below. Their designs and documented behaviour informed
+it, and they are credited here:
+
+- [`joshua-zyy/pi-cli-subagents`](https://github.com/joshua-zyy/pi-cli-subagents)
+  (MIT): driving Claude Code through stream-json with `--permission-prompt-tool
+  stdio`, Codex through `codex app-server`, detached per-child workers that
+  outlive the parent session, and automatic delivery of child reports.
+- Mario Zechner's [`pi-subagent`](https://github.com/badlogic/pi-subagent)
+  (no license published, so only ideas were used): persistent pi children with
+  their own sessions, an on-disk inbox for steering and follow-ups, and
+  suspend/resume tied to the parent session.

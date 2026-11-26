@@ -31,6 +31,9 @@ async function harness(t, hasUI = true, cwd = process.cwd(), withGoal = false) {
   let canonicalOverride;
   let clientVersion = "OpenSSH_9.9p1";
   let failedSchedulerHost;
+  // Raw scheduler output overrides; sacct: false simulates disabled accounting.
+  let squeueOutput;
+  let sacctOutput;
   t.mock.method(childProcess, "spawn", (client, args) => {
     assert.ok(client === "ssh" || client === "scp");
     calls.push({ client, args });
@@ -53,8 +56,15 @@ async function harness(t, hasUI = true, cwd = process.cwd(), withGoal = false) {
       else if (command.includes("long-output")) output = "long log line\n".repeat(2100);
       else if (command.includes("__PI_HPC_METADATA__")) output = "__PI_HPC_METADATA__HOME=/home/test\n__PI_HPC_METADATA__USER=test\n__PI_HPC_METADATA__PWD=/home/test\n";
       else if (command.startsWith("realpath -m")) output = canonicalOverride || "/scratch/test/file\n";
-      else if (command.startsWith("squeue")) output = `123|${schedulerState}\n`;
-      else if (command.includes("sbatch")) output = "Submitted batch job 999\n";
+      else if (command.startsWith("squeue")) output = squeueOutput ?? `123|${schedulerState}\n`;
+      else if (command.startsWith("sacct") && sacctOutput === false) {
+        child.stderr.end("Slurm accounting storage is disabled");
+        child.stdout.end();
+        child.emit("close", 1);
+        return;
+      }
+      else if (command.startsWith("sacct") && sacctOutput !== undefined) output = sacctOutput;
+      else if (command.includes("sbatch")) output = command.match(/(?<![.\w])sbatch\s/g).map((_, i) => `Submitted batch job ${999 + i}\n`).join("");
       else if (command.startsWith("cd --") && command.endsWith("pwd -P")) output = "/scratch/test\n";
       child.stdout.end(output);
       child.stderr.end();
@@ -121,6 +131,8 @@ async function harness(t, hasUI = true, cwd = process.cwd(), withGoal = false) {
     canonical: (path) => { canonicalOverride = path; },
     clientVersion: (version) => { clientVersion = version; },
     schedulerFailure: (host) => { failedSchedulerHost = host; },
+    squeue: (output) => { squeueOutput = output; },
+    sacct: (output) => { sacctOutput = output; },
   };
 }
 
@@ -725,4 +737,178 @@ test("site guidance from config reaches the system prompt; no config means no ho
   await empty.command("allow cluster-a");
   assert.equal(empty.calls.length, 0);
   assert.ok(empty.notifications.some((message) => /No hosts are configured/.test(message)));
+});
+
+test("subagents: parent publishes grants; a pi child inherits them live and cannot grant itself", async (t) => {
+  const parent = await harness(t);
+  const published = [];
+  parent.bus.on("hpc-mode:grants-changed", (grants) => published.push(grants.map((g) => g.host)));
+  await parent.command("allow cluster-a");
+  let queried;
+  parent.bus.emit("hpc-mode:grants-query", { reply: (grants) => { queried = grants; } });
+  assert.equal(queried[0].host, "cluster-a");
+  assert.ok(queried[0].home && queried[0].username);
+  await parent.command("revoke cluster-a");
+  assert.deepEqual(published.slice(-2), [["cluster-a"], []]);
+
+  const runDir = mkdtempSync(join(systemTmpdir(), "hpc-child-"));
+  process.env.PI_SUBAGENT_RUN_DIR = runDir;
+  t.after(() => { delete process.env.PI_SUBAGENT_RUN_DIR; });
+  const child = await harness(t);
+  await assert.rejects(child.tool("hpc_exec", { host: "cluster-a", command: "pwd" }), /user-authorized/);
+  writeFileSync(join(runDir, "hpc-grants.json"), JSON.stringify({ grants: [{ host: "cluster-a", remoteCwd: "/home/u", home: "/home/u", username: "u" }] }));
+  await child.tool("hpc_exec", { host: "cluster-a", command: "pwd" });
+  assert.match(child.calls.at(-1).args.join(" "), /cluster-a/);
+  writeFileSync(join(runDir, "hpc-grants.json"), JSON.stringify({ grants: [{ host: "evil.example", remoteCwd: "/", home: "/", username: "x" }] }));
+  await assert.rejects(child.tool("hpc_exec", { host: "cluster-a", command: "pwd" }), /no longer authorized/);
+  const before = child.calls.length;
+  await child.command("allow cluster-a");
+  assert.equal(child.calls.length, before, "a child cannot grant HPC access itself");
+  assert.match(child.notifications.join("\n"), /inherited from the coordinating session/);
+});
+
+test("after peer messages, HPC grants need the user's decision again", async (t) => {
+  const h = await harness(t);
+  await h.command("allow cluster-a");
+  await h.tool("hpc_exec", { host: "cluster-a", command: "pwd" });
+  // agent-comm reports that this session has read peer messages.
+  h.bus.on("agent-comm:exposure-query", (request) => request.reply({ exposed: true, senders: ["peer (abc)"], waived: false }));
+  let answer = "Deny";
+  const prompts = [];
+  h.ctx.ui.select = async (title, choices) => { prompts.push(title); return answer; };
+  await assert.rejects(h.tool("hpc_exec", { host: "cluster-a", command: "pwd" }), /other agents \(peer \(abc\)\)/);
+  await assert.rejects(h.tool("hpc_transfer", { host: "cluster-a", direction: "upload", local_path: "a", remote_path: "b" }), /user denied/);
+  answer = "Allow once";
+  await h.tool("hpc_exec", { host: "cluster-a", command: "pwd" });
+  assert.equal(prompts.length, 3);
+  h.ctx.hasUI = false;
+  await assert.rejects(h.tool("hpc_exec", { host: "cluster-a", command: "pwd" }), /No user is attached/);
+});
+
+// Scheduler output as "squeue --array --format='%i|%A|%T'" and
+// "sacct --allocations --parsable2 --format=JobID,JobIDRaw,State" print it.
+async function arrayHarness(t) {
+  const h = await harness(t);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  await h.command("allow cluster-a");
+  const poll = async (squeue, sacct = "") => {
+    h.squeue(squeue);
+    h.sacct(sacct);
+    h.messages.length = 0;
+    t.mock.timers.tick(210_000); // Past the slowest poll interval, jitter included.
+    await flush();
+    const watches = (await h.tool("hpc_job_watch", { action: "list" })).details.watches;
+    return { states: Object.fromEntries(watches.map((w) => [w.job_id, w.last_state])), update: h.messages.at(-1)?.[0].content };
+  };
+  const commands = (name) => h.calls.map((call) => call.args.at(-1)).filter((command) => command.startsWith(name));
+  return { h, poll, commands };
+}
+
+test("an array task is followed through accounting after it leaves squeue", async (t) => {
+  const { h, poll, commands } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_id: "34870500_9", until: "finished" });
+  // Still pending: squeue --array lists the task itself; sacct only knows the range.
+  assert.deepEqual((await poll("34870500_9|34870500|PENDING\n")).states, { "34870500_9": "PENDING" });
+  assert.deepEqual((await poll("", "34870500_[8-10%2]|34870500|PENDING\n")).states, { "34870500_9": "PENDING" });
+  assert.deepEqual((await poll("", "34870500_[1-7]|34870500|PENDING\n")).states, { "34870500_9": "UNKNOWN" });
+  assert.deepEqual((await poll("34870500_9|34870509|RUNNING\n")).states, { "34870500_9": "RUNNING" });
+  assert.match(commands("squeue").at(-1), /--array --jobs '34870500_9' --format='%i\|%A\|%T'/);
+  // Gone from squeue: sacct reports ARRAYID_TASK in JobID, the internal ID only in JobIDRaw.
+  const done = await poll("", "34870500_8|34870508|RUNNING\n34870500_9|34870509|COMPLETED\n");
+  assert.match(commands("sacct").at(-1), /--jobs '34870500_9' --format=JobID,JobIDRaw,State/);
+  assert.match(done.update, /job 34870500_9 finished with state COMPLETED/);
+  assert.deepEqual(done.states, {});
+});
+
+test("a watch by the raw ID of an array task still resolves", async (t) => {
+  const { h, poll } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_id: "34870509", until: "finished" });
+  assert.deepEqual((await poll("34870500_9|34870509|RUNNING\n")).states, { "34870509": "RUNNING" });
+  assert.match((await poll("", "34870500_9|34870509|TIMEOUT\n")).update, /job 34870509 finished with state TIMEOUT/);
+});
+
+test("a bare array ID covers all tasks: any running task counts as running", async (t) => {
+  const { h, poll } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_id: "34870500", until: "running" });
+  // All tasks pending; the unsplit record carries the array ID as its raw ID.
+  const pending = await poll("34870500_1|34870500|PENDING\n34870500_2|34870500|PENDING\n");
+  assert.deepEqual(pending.states, { "34870500": "PENDING" });
+  assert.equal(pending.update, undefined);
+  const running = await poll("34870500_1|34870501|PENDING\n34870500_2|34870500|RUNNING\n");
+  assert.match(running.update, /job 34870500 reached RUNNING/);
+});
+
+test("a bare array ID finishes only when every task has ended", async (t) => {
+  const { h, poll, commands } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_id: "34870500", until: "finished" });
+  // Task 10's raw ID equals the array ID and it has completed; task 9 still runs.
+  const partial = await poll("34870500_9|34870509|RUNNING\n34870500_10|34870500|COMPLETED\n", "34870500_10|34870500|COMPLETED\n");
+  assert.deepEqual(partial.states, { "34870500": "RUNNING" });
+  assert.equal(partial.update, undefined);
+  assert.equal(commands("sacct").length, 0, "accounting is not needed while squeue shows an active task");
+  // Only pending tasks left, e.g. behind a %throttle.
+  assert.deepEqual((await poll("34870500_3|34870500|PENDING\n")).states, { "34870500": "PENDING" });
+  // Queue empty, but accounting still has task 9 running: keep waiting.
+  const lagging = await poll("", "34870500_1|34870501|COMPLETED\n34870500_9|34870509|RUNNING\n34870500_10|34870500|COMPLETED\n");
+  assert.deepEqual(lagging.states, { "34870500": "RUNNING" });
+  // A task still waiting in accounting as a range also blocks completion.
+  assert.deepEqual((await poll("", "34870500_1|34870501|COMPLETED\n34870500_[2-10]|34870500|PENDING\n")).states, { "34870500": "PENDING" });
+  const tasks = Array.from({ length: 10 }, (_, i) => `34870500_${i + 1}|${34870501 + i}|COMPLETED\n`).join("");
+  // The last finished task lingers in squeue; accounting supplies the others.
+  const done = await poll("34870500_10|34870500|COMPLETED\n", tasks);
+  assert.match(done.update, /job 34870500 finished with state COMPLETED$/);
+  assert.deepEqual(done.states, {});
+});
+
+test("a finished array with failures reports per-state task counts", async (t) => {
+  const { h, poll } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_ids: ["34870500", "600", "700"], until: "finished" });
+  const sacct = [
+    ...Array.from({ length: 6 }, (_, i) => `34870500_${i + 1}|${34870501 + i}|COMPLETED`),
+    "34870500_7|34870507|FAILED", "34870500_8|34870508|FAILED", "34870500_9|34870509|TIMEOUT",
+    "34870500_10|34870500|CANCELLED by 1000",
+    // Cancelled before starting: one record for three tasks.
+    "600_1|601|FAILED", "600_[2-4]|600|CANCELLED",
+    // Heterogeneous job: components are reported as 700+0, 700+1.
+    "700+0|700|COMPLETED", "700+1|701|OUT_OF_MEMORY",
+  ].join("\n");
+  const done = await poll("", sacct);
+  assert.match(done.update, /job 34870500 finished with state FAILED \(10 tasks: 6 COMPLETED, 2 FAILED, 1 TIMEOUT, 1 CANCELLED\)/);
+  assert.match(done.update, /job 600 finished with state CANCELLED \(4 tasks: 3 CANCELLED, 1 FAILED\)/);
+  assert.match(done.update, /job 700 finished with state OUT_OF_MEMORY \(2 components: 1 COMPLETED, 1 OUT_OF_MEMORY\)/);
+  assert.deepEqual(done.states, {});
+});
+
+test("without accounting, squeue alone decides that an array has no active task left", async (t) => {
+  const { h, poll } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_id: "34870500", until: "finished" });
+  assert.deepEqual((await poll("34870500_1|34870501|COMPLETED\n34870500_2|34870500|RUNNING\n", false)).states, { "34870500": "RUNNING" });
+  assert.deepEqual((await poll("", false)).states, { "34870500": "UNKNOWN" });
+  const done = await poll("34870500_1|34870501|COMPLETED\n34870500_2|34870500|FAILED\n", false);
+  assert.match(done.update, /job 34870500 finished with state FAILED \(2 tasks: 1 COMPLETED, 1 FAILED\)/);
+});
+
+test("plain jobs are unaffected by array handling", async (t) => {
+  const { h, poll, commands } = await arrayHarness(t);
+  await h.tool("hpc_job_watch", { action: "watch", job_ids: ["123", "124", "125"], until: "finished" });
+  // Other jobs and arrays in the listing (the --user fallback prints everything) are ignored.
+  const queued = await poll("123|123|RUNNING\n1234|1234|FAILED\n12_3|123|FAILED\n124|124|PENDING\n");
+  assert.deepEqual(queued.states, { "123": "RUNNING", "124": "PENDING", "125": "UNKNOWN" });
+  assert.match(commands("sacct").at(-1), /--jobs '125' /);
+  // A terminal state seen in squeue is final without accounting, as before.
+  const first = await poll("123|123|COMPLETED\n124|124|RUNNING\n", "125|125|CANCELLED by 1000\n");
+  assert.match(first.update, /job 123 finished with state COMPLETED\n/);
+  assert.match(first.update, /job 125 finished with state CANCELLED$/);
+  assert.deepEqual(first.states, { "124": "RUNNING" });
+  // Legacy two-column output still parses.
+  assert.match((await poll("", "124|FAILED\n")).update, /job 124 finished with state FAILED$/);
+});
+
+test("one sbatch command that submits several jobs lists them all in the reminder", async (t) => {
+  const h = await harness(t);
+  await h.command("allow cluster-a");
+  const text = (await h.tool("hpc_exec", { host: "cluster-a", command: "sbatch a.sbatch && sbatch --array=1-10 b.sbatch" })).content.map((item) => item.text).join("\n");
+  assert.match(text, /jobs 999, 1000 were submitted/);
+  assert.match(text, /job_ids \["999","1000"\]/);
+  assert.match(text, /bare ID covers all tasks/);
 });

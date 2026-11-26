@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, posix, sep } from "node:path";
 import { shellSafetyReason } from "./safety-guard.js";
+import { peerGate } from "./agent-comm/gate.ts";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Skill } from "@earendil-works/pi-coding-agent";
 import {
@@ -258,23 +259,114 @@ function pollIntervalFor(state: string | undefined, until: JobWatchTarget): numb
 	return Math.round(base * jitter);
 }
 
-function parseSlurmStates(output: string, requestedIds: readonly string[]): Map<string, string> {
-	const requested = new Set(requestedIds);
-	const states = new Map<string, string>();
+interface SlurmJobRecord {
+	/** Display ID: 123, 123_4 (array task), 123_[5-10%2] (pending array tasks), or 123+1 (heterogeneous component). */
+	id: string;
+	/** Internal numeric ID. For array tasks it differs from the display ID, and one task's raw ID equals the array ID. */
+	rawId?: string;
+	state: string;
+}
+
+/** What scheduler output says about one watched ID. squeue is parsed before sacct, and the first record per ID wins. */
+interface SlurmJobMatch {
+	direct?: string;
+	/** Array tasks or heterogeneous components of a bare watched ID, keyed by display ID. */
+	members: Map<string, { state: string; count: number }>;
+	/** A record whose raw ID (not its display ID) equals the watched ID. */
+	raw?: string;
+}
+
+// Lines are "JobID|State" or "JobID|JobIDRaw|State".
+function parseSlurmRecords(output: string): SlurmJobRecord[] {
+	const records: SlurmJobRecord[] = [];
 	for (const line of output.split(/\r?\n/)) {
-		const separator = line.indexOf("|");
-		if (separator < 0) continue;
-		const rawId = line.slice(0, separator).trim();
-		const state = normalizeSlurmState(line.slice(separator + 1));
-		if (requested.has(rawId) && !states.has(rawId)) {
-			states.set(rawId, state);
+		const fields = line.split("|").map((field) => field.trim());
+		// Steps (123.batch) never describe the whole job.
+		if (fields.length < 2 || !fields[0] || fields[0].includes(".")) continue;
+		records.push({
+			id: fields[0],
+			rawId: fields.length > 2 && fields[1] ? fields[1] : undefined,
+			state: normalizeSlurmState(fields[fields.length - 1]),
+		});
+	}
+	return records;
+}
+
+// "1-10", "1,3,5-9:2", "0-15%4". squeue can truncate long specifications with "...".
+function parseArrayTaskSpec(spec: string): { ranges: Array<[number, number, number]>; complete: boolean } {
+	const ranges: Array<[number, number, number]> = [];
+	let complete = true;
+	for (const part of spec.replace(/%\d+$/, "").split(",")) {
+		const match = part.trim().match(/^(\d+)(?:-(\d+)(?::(\d+))?)?$/);
+		if (!match) {
+			complete = false;
 			continue;
 		}
-		for (const id of requested) {
-			if (!states.has(id) && rawId.startsWith(`${id}_[`)) states.set(id, state);
+		const first = Number(match[1]);
+		ranges.push([first, match[2] ? Number(match[2]) : first, Math.max(1, Number(match[3] ?? 1))]);
+	}
+	return { ranges, complete };
+}
+
+function collectSlurmMatches(records: readonly SlurmJobRecord[], requestedIds: readonly string[], matches: Map<string, SlurmJobMatch>) {
+	for (const record of records) {
+		const parsed = record.id.match(/^(\d+)(?:_(\d+)|_\[(.*)\]|\+(\d+))?$/);
+		const [, base, task, spec, component] = parsed ?? [];
+		const isMember = task !== undefined || spec !== undefined || component !== undefined;
+		for (const id of requestedIds) {
+			let match = matches.get(id);
+			if (!match) matches.set(id, match = { members: new Map() });
+			if (record.id === id) {
+				match.direct ??= record.state;
+			} else if (isMember && base === id) {
+				if (match.members.has(record.id)) continue;
+				const tasks = spec === undefined ? undefined : parseArrayTaskSpec(spec);
+				const count = tasks?.complete ? tasks.ranges.reduce((sum, [first, last, step]) => sum + Math.max(0, Math.floor((last - first) / step) + 1), 0) : 1;
+				match.members.set(record.id, { state: record.state, count: Math.max(1, count) });
+			} else if (spec !== undefined && id.startsWith(`${base}_`)) {
+				// A still-pending array task is reported only as part of ARRAYID_[range].
+				const wanted = Number(id.slice(base.length + 1));
+				const listed = parseArrayTaskSpec(spec).ranges.some(([first, last, step]) => wanted >= first && wanted <= last && (wanted - first) % step === 0);
+				if (listed) match.direct ??= record.state;
+			} else if (record.rawId === id) {
+				match.raw ??= record.state;
+			}
 		}
 	}
-	return states;
+}
+
+// A bare array (or heterogeneous) job ID covers all its tasks: it is RUNNING
+// while any task runs and terminal only once every known task is terminal.
+function aggregateMemberStates(members: SlurmJobMatch["members"]): string {
+	const entries = [...members.values()];
+	const active = entries.map((entry) => entry.state).filter((state) => !isTerminalJobState(state));
+	if (active.length > 0) return ["RUNNING", "COMPLETING", "PENDING"].find((state) => active.includes(state)) ?? active[0];
+	const counts = new Map<string, number>();
+	let total = 0;
+	for (const { state, count } of entries) {
+		counts.set(state, (counts.get(state) ?? 0) + count);
+		total += count;
+	}
+	if (counts.size === 1 && (total === 1 || counts.has("COMPLETED"))) return entries[0].state;
+	const sorted = [...counts].sort((a, b) => b[1] - a[1]);
+	// The first word stays a plain Slurm state so callers can classify it.
+	const headline = sorted.find(([state]) => state !== "COMPLETED")![0];
+	const unit = [...members.keys()].some((id) => id.includes("+")) ? "components" : "tasks";
+	return `${headline} (${total} ${unit}: ${sorted.map(([state, count]) => `${count} ${state}`).join(", ")})`;
+}
+
+function slurmMatchState(match: SlurmJobMatch | undefined): string | undefined {
+	if (!match) return undefined;
+	// Members win over a raw-ID match: one array task's raw ID equals the array ID.
+	return match.members.size > 0 ? aggregateMemberStates(match.members) : match.direct ?? match.raw;
+}
+
+// squeue lists every pending or running task, so it alone decides whether an
+// array is still active. Accounting is needed once nothing is active: for jobs
+// that left the queue and for the tasks of an array that finished earlier.
+function needsAccounting(match: SlurmJobMatch | undefined): boolean {
+	const state = slurmMatchState(match);
+	return state === undefined || (match!.members.size > 0 && isTerminalJobState(state));
 }
 
 function remotePathTouchesSsh(path: string): boolean {
@@ -426,26 +518,32 @@ async function sshExec(host: string, command: string, options: SshRunOptions = {
 async function querySlurmStates(state: RemoteState, jobIds: readonly string[]): Promise<Map<string, string>> {
 	if (jobIds.length === 0) return new Map();
 	const requested = shellQuote(jobIds.join(","));
+	// --array prints one line per array task (also for pending tasks), %A the raw job ID.
 	const squeueOutput = await sshExec(
 		state.host,
-		`squeue --noheader --jobs ${requested} --format='%i|%T' 2>/dev/null || squeue --noheader --user "$USER" --format='%i|%T'`,
+		`squeue --noheader --array --jobs ${requested} --format='%i|%A|%T' 2>/dev/null || squeue --noheader --array --user "$USER" --format='%i|%A|%T'`,
 		{ timeoutSeconds: SCHEDULER_QUERY_TIMEOUT_SECONDS },
 	);
-	const states = parseSlurmStates(squeueOutput.toString(), jobIds);
-	const missing = jobIds.filter((jobId) => !states.has(jobId));
-	if (missing.length === 0) return states;
-
-	try {
-		const sacctOutput = await sshExec(
-			state.host,
-			`sacct --allocations --noheader --parsable2 --jobs ${shellQuote(missing.join(","))} --format=JobIDRaw,State`,
-			{ timeoutSeconds: SCHEDULER_QUERY_TIMEOUT_SECONDS },
-		);
-		for (const [jobId, jobState] of parseSlurmStates(sacctOutput.toString(), missing)) {
-			states.set(jobId, jobState);
+	const matches = new Map<string, SlurmJobMatch>();
+	collectSlurmMatches(parseSlurmRecords(squeueOutput.toString()), jobIds, matches);
+	const missing = jobIds.filter((jobId) => needsAccounting(matches.get(jobId)));
+	if (missing.length > 0) {
+		try {
+			// JobID is ARRAYID_TASK for array tasks; JobIDRaw alone would never match such a watch.
+			const sacctOutput = await sshExec(
+				state.host,
+				`sacct --allocations --noheader --parsable2 --jobs ${shellQuote(missing.join(","))} --format=JobID,JobIDRaw,State`,
+				{ timeoutSeconds: SCHEDULER_QUERY_TIMEOUT_SECONDS },
+			);
+			collectSlurmMatches(parseSlurmRecords(sacctOutput.toString()), missing, matches);
+		} catch {
+			// Accounting may be disabled or lagging. Missing jobs remain UNKNOWN and are retried conservatively.
 		}
-	} catch {
-		// Accounting may be disabled or lagging. Missing jobs remain UNKNOWN and are retried conservatively.
+	}
+	const states = new Map<string, string>();
+	for (const jobId of jobIds) {
+		const jobState = slurmMatchState(matches.get(jobId));
+		if (jobState !== undefined) states.set(jobId, jobState);
 	}
 	return states;
 }
@@ -587,6 +685,48 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 	let authorizationGeneration = 0;
 	let transferClientChecked = false;
 
+	// Subagents: a pi child inherits the coordinating session's grants through a
+	// file its parent rewrites on every /hpc allow or revoke (extensions/subagents).
+	const inheritedGrantsFile = process.env.PI_SUBAGENT_RUN_DIR ? resolve(process.env.PI_SUBAGENT_RUN_DIR, "hpc-grants.json") : undefined;
+
+	function grantList() {
+		return [...authorized.values()].map(({ host, remoteCwd, home, username }) => ({ host, remoteCwd, home, username }));
+	}
+
+	function publishGrants() {
+		if (!inheritedGrantsFile) pi.events.emit("hpc-mode:grants-changed", grantList());
+	}
+
+	pi.events.on("hpc-mode:grants-query", (request: { reply: (grants: ReturnType<typeof grantList>) => void }) => {
+		request.reply(grantList());
+	});
+
+	function syncInheritedGrants() {
+		if (!inheritedGrantsFile) return;
+		let grants: unknown = [];
+		try {
+			grants = JSON.parse(readFileSync(inheritedGrantsFile, "utf8")).grants;
+		} catch {
+			grants = [];
+		}
+		const valid = (Array.isArray(grants) ? grants : []).filter((g): g is RemoteState =>
+			typeof g?.host === "string" && allowedHostSet.has(g.host)
+			&& typeof g.remoteCwd === "string" && typeof g.home === "string" && typeof g.username === "string");
+		const hosts = new Set(valid.map((g) => g.host));
+		for (const host of [...authorized.keys()]) {
+			if (hosts.has(host)) continue;
+			authorizationGeneration += 1;
+			authorized.delete(host);
+			if (remote?.host === host) remote = undefined;
+			for (const [key, watch] of jobWatches) if (watch.host === host) jobWatches.delete(key);
+		}
+		for (const grant of valid) {
+			if (authorized.has(grant.host)) continue;
+			authorized.set(grant.host, { host: grant.host, remoteCwd: grant.remoteCwd, home: grant.home, username: grant.username });
+			previouslyAuthorized.add(grant.host);
+		}
+	}
+
 	function checkRemoteCommand(command: string): string | undefined {
 		let removalAllowed = false;
 		pi.events.emit("safety-guard:removal-rights-query", { reply: (allowed: boolean) => { removalAllowed = allowed; } });
@@ -594,6 +734,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 	}
 
 	function authorizedHost(host?: string): RemoteState {
+		syncInheritedGrants();
 		const selected = host?.trim().toLowerCase() || remote?.host || (authorized.size === 1 ? [...authorized.keys()][0] : undefined);
 		const state = selected ? authorized.get(selected) : undefined;
 		if (state) return state;
@@ -641,10 +782,12 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 		const combined = (result.content ?? [])
 			.map((item) => (item.type === "text" && typeof item.text === "string" ? item.text : ""))
 			.join("\n");
-		const submitted = /\bsbatch\b/.test(command) ? combined.match(/Submitted batch job (\d+)/) : null;
+		// One command can submit several jobs; an array submission prints only the array ID.
+		const submitted = /\bsbatch\b/.test(command) ? [...new Set([...combined.matchAll(/Submitted batch job (\d+)/g)].map((match) => match[1]))] : [];
 		let note: string | undefined;
-		if (submitted) {
-			note = `Reminder: Slurm job ${submitted[1]} was submitted on ${host}. To wait for it, register hpc_job_watch (action "watch", job_id "${submitted[1]}", until "running" or "finished") instead of polling squeue/sacct. Several jobs can share one watch call (job_ids). After registering, end your turn with a summary; the watcher resumes the conversation on the transition or expiry.`;
+		if (submitted.length > 0) {
+			const target = submitted.length === 1 ? `job_id "${submitted[0]}"` : `job_ids ${JSON.stringify(submitted)}`;
+			note = `Reminder: Slurm job${submitted.length === 1 ? "" : "s"} ${submitted.join(", ")} ${submitted.length === 1 ? "was" : "were"} submitted on ${host}. To wait for ${submitted.length === 1 ? "it" : "them"}, register hpc_job_watch (action "watch", ${target}, until "running" or "finished") instead of polling squeue/sacct. Several jobs can share one watch call (job_ids). For a job array, the bare ID covers all tasks (finished = every task ended); ID_TASK watches one task. After registering, end your turn with a summary; the watcher resumes the conversation on the transition or expiry.`;
 		} else if (SCHEDULER_CHECK_PATTERN.test(command)) {
 			const used = manualChecks.get(host) ?? 0;
 			const remaining = Math.max(0, MAX_MANUAL_SCHEDULER_CHECKS - used);
@@ -840,6 +983,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 	}
 
 	async function pollJobWatches() {
+		syncInheritedGrants();
 		if (watcherPollInProgress || authorized.size === 0 || jobWatches.size === 0 || !currentContext) return;
 		const ctx = currentContext;
 		const generation = runtimeGeneration;
@@ -950,6 +1094,10 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 			return undefined;
 		}
 		if (authorized.has(host)) return authorized.get(host);
+		if (inheritedGrantsFile) {
+			notify(ctx, "This is a subagent: HPC access is inherited from the coordinating session's /hpc grants and cannot be granted here.", "error");
+			return undefined;
+		}
 		if (!ctx.hasUI) {
 			notify(ctx, "HPC access requires a user command with confirmation UI.", "error");
 			return undefined;
@@ -964,6 +1112,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 			if (generation !== authorizationGeneration) return undefined;
 			authorized.set(host, candidate);
 			previouslyAuthorized.add(host);
+			publishGrants();
 			currentContext = ctx;
 			updateStatus(ctx);
 			notify(ctx, `HPC access authorized: ${host}`);
@@ -1112,7 +1261,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 		name: "hpc_job_watch",
 		label: "HPC Job Watch",
 		description:
-			"Manage conservative background Slurm job watches on user-authorized HPC hosts, including while the workspace is local. Actions: watch (job_id or job_ids; until defaults to running), list, and stop (job_id optional; omitted stops all). After a successful watch, finish remaining submissions and end your turn with a summary; manual scheduler checks and sleep on that host are refused, and only a few further HPC-touching turns are allowed. The harness polls Slurm without model requests (about every minute while pending/unknown, every 3 minutes while running toward finished, with jitter, rate limiting, and backoff) and resumes the conversation only when a job reaches the requested state, ends, or the watch expires. Watches stop on those events, host revocation, reload, or session shutdown; switching workspaces does not stop them.",
+			"Manage conservative background Slurm job watches on user-authorized HPC hosts, including while the workspace is local. Actions: watch (job_id or job_ids; until defaults to running), list, and stop (job_id optional; omitted stops all). After a successful watch, finish remaining submissions and end your turn with a summary; manual scheduler checks and sleep on that host are refused, and only a few further HPC-touching turns are allowed. The harness polls Slurm without model requests (about every minute while pending/unknown, every 3 minutes while running toward finished, with jitter, rate limiting, and backoff) and resumes the conversation only when a job reaches the requested state, ends, or the watch expires. A bare job-array ID covers all its tasks: running fires when any task runs, finished only when every task has ended, reporting an aggregate state such as FAILED (10 tasks: 7 COMPLETED, 3 FAILED); ARRAYID_TASK watches one task. Watches stop on those events, host revocation, reload, or session shutdown; switching workspaces does not stop them.",
 		promptSnippet: "Watch Slurm jobs without remote sleep processes or aggressive scheduler polling",
 		promptGuidelines: [
 			"Use hpc_job_watch instead of sleep or watch commands when waiting for a Slurm job to start or finish on an authorized HPC host.",
@@ -1252,6 +1401,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 				if (remote && !authorized.has(remote.host)) remote = undefined;
 				for (const [key, watch] of jobWatches) if (!authorized.has(watch.host)) jobWatches.delete(key);
 				if (jobWatches.size === 0) stopWatcherTimer();
+				publishGrants();
 				updateStatus(ctx);
 				notify(ctx, `Revoked HPC access: ${host}. Existing submitted jobs are not cancelled.`);
 				return;
@@ -1339,6 +1489,8 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 				isActive: () => jobWatches.size > 0 || watcherPollInProgress,
 			});
 		}
+		syncInheritedGrants();
+		publishGrants();
 		updateStatus(ctx);
 	});
 
@@ -1367,6 +1519,7 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		if (event.messageType === "custom" && event.message?.customType === "hpc-job-watch") resetMonitoringGuard();
 		refreshLocalSkillReads(event.systemPromptOptions.skills, event.prompt ?? "");
+		syncInheritedGrants();
 		if (authorized.size === 0) return {
 			systemPrompt: `${event.systemPrompt}\n\n# Current HPC authorization\nAuthorized hosts: none. Workspace: local. Previous grants in the conversation are historical, not current permission. Do not request remote execution, transfers, or watch registration until the user runs /hpc allow <host>. Reload and idle session shutdown clear permission; existing Slurm jobs are not cancelled.`,
 		};
@@ -1395,6 +1548,12 @@ export default function hpcModeExtension(pi: ExtensionAPI) {
 				// mistakes come back as ordinary tool errors.
 				return { block: true, reason: formatError(error), ...(monitoringStop ? { terminate: true } : {}) };
 			}
+		}
+		// HPC access is a user grant: after reading peer messages, the user decides again.
+		if (requiresAuthorization || (remote !== undefined && ["bash", "read", "write", "edit"].includes(event.toolName))) {
+			const what = typeof event.input.command === "string" ? event.input.command : typeof event.input.path === "string" ? event.input.path : JSON.stringify(event.input).slice(0, 300);
+			const gate = await peerGate(pi, ctx, event.toolCallId, `${event.toolName} on HPC: ${what}`);
+			if (gate) return gate;
 		}
 		const host = event.toolName === "hpc_exec" && typeof event.input.host === "string"
 			? event.input.host.trim().toLowerCase()
